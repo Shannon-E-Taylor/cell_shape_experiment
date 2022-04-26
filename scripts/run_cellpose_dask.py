@@ -37,6 +37,7 @@ def segment(
     channels,
     model_type,
     diameter,
+    file, 
     anisotropy = 1, 
     fast_mode=False,
     use_anisotropy=True,
@@ -76,14 +77,29 @@ def segment(
     diameter_yx = diameter[1]
     # anisotropy = diameter[0] / diameter[1] if use_anisotropy else None
 
+    # original code 
     image = da.asarray(image)
-    image = image.rechunk(chunks = (-1, 500, 500, -1))  # chunk z axis and color channel together 
+    image = image.rechunk({-1: -1})  # color channel is chunked together
 
     depth = tuple(np.ceil(diameter).astype(np.int64))
     boundary = "reflect"
 
     # No chunking in channel direction
     image = da.overlap.overlap(image, depth + (0,), boundary)
+
+
+    ### 
+    # my code - runs in RAM 
+    #### 
+
+    # image = da.asarray(image)
+    # image = image.rechunk(chunks = (-1, 700, 700, -1))  # chunk z axis and color channel together 
+
+    # depth = tuple(np.ceil(diameter).astype(np.int64)*2) # 
+    # boundary = "reflect"
+
+    # # No chunking in channel direction
+    # image = da.overlap.overlap(image, depth + (0,), boundary)
 
     block_iter = zip(
         np.ndindex(*image.numblocks),
@@ -104,6 +120,7 @@ def segment(
             anisotropy,
             fast_mode,
             index,
+            file
         )
 
         shape = input_block.shape[:-1]
@@ -120,6 +137,7 @@ def segment(
         labeled_blocks[index[:-1]] = labeled_block
         total += n
 
+    print('finished segmentation')
     # Put all the blocks together
     block_labeled = da.block(labeled_blocks.tolist())
 
@@ -162,6 +180,7 @@ def segment_chunk(
     anisotropy,
     fast_mode,
     index,
+    file
 ):
     """Perform segmentation on an individual chunk."""
     # Cellpose seems to have some randomness, which is made deterministic by using the block
@@ -175,23 +194,32 @@ def segment_chunk(
 
     model = models.Cellpose(gpu=True, model_type=model_type, net_avg=not fast_mode)
 
+    f = file + str(index) + '.npy'
 
+    if f not in os.listdir('../scratch/'): 
+        logger.info("Evaluating model")
+        segments, _, _, _ = model.eval(
+            chunk,
+            channels=channels,
+            z_axis=0,
+            channel_axis=3,
+            diameter=diameter_yx,
+            do_3D=True,
+            # batch_size = 1, # try smaller batch size for memory 
+            anisotropy=anisotropy,
+            flow_threshold=0, # The QC step throws out masks that produce flows which are substantially different from the network's predicted flows. This mask->flow computation takes some time.    https://github.com/MouseLand/cellpose/issues/119 
+            #rescale = True, 
+            net_avg=not fast_mode,
+            augment=not fast_mode,
+            tile=not fast_mode,
+        )
+        logger.info("Done segmenting chunk")
 
-    logger.info("Evaluating model")
-    segments, _, _, _ = model.eval(
-        chunk,
-        channels=channels,
-        z_axis=0,
-        channel_axis=3,
-        diameter=diameter_yx,
-        do_3D=True,
-        batch_size = 1, # try smaller batch size for memory 
-        anisotropy=anisotropy,
-        net_avg=not fast_mode,
-        augment=not fast_mode,
-        tile=not fast_mode,
-    )
-    logger.info("Done segmenting chunk")
+        # save intermediate 
+        np.save('../scratch/' + file + str(index), segments)
+    else: 
+        # load existing segment if it exists
+        segments = np.load('../scratch/' + f)
 
     return segments.astype(np.int32), segments.max()
 
@@ -202,12 +230,14 @@ def link_labels(block_labeled, total, depth, iou_threshold=1):
     use this graph to find connected components, and then relabel each
     block according to those.
     """
+    gc.collect() 
     label_groups = label_adjacency_graph(block_labeled, total, depth, iou_threshold)
     new_labeling = _label.connected_components_delayed(label_groups)
     return _label.relabel_blocks(block_labeled, new_labeling)
 
 
 def label_adjacency_graph(labels, nlabels, depth, iou_threshold):
+    gc.collect() 
     all_mappings = [da.empty((2, 0), dtype=np.int32, chunks=1)]
 
     slices_and_axes = get_slices_and_axes(labels.chunks, labels.shape, depth)
@@ -223,12 +253,14 @@ def label_adjacency_graph(labels, nlabels, depth, iou_threshold):
 
 def _across_block_iou_delayed(face, axis, iou_threshold):
     """Delayed version of :func:`_across_block_label_grouping`."""
+    gc.collect() 
     _across_block_label_grouping_ = dask.delayed(_across_block_label_iou)
     grouped = _across_block_label_grouping_(face, axis, iou_threshold)
     return da.from_delayed(grouped, shape=(2, np.nan), dtype=np.int32)
 
 
 def _across_block_label_iou(face, axis, iou_threshold):
+    gc.collect() 
     unique = np.unique(face)
     face0, face1 = np.split(face, 2, axis)
 
@@ -254,6 +286,7 @@ def _across_block_label_iou(face, axis, iou_threshold):
 
 
 def get_slices_and_axes(chunks, shape, depth):
+    gc.collect()
     ndim = len(shape)
     depth = da.overlap.coerce_depth(ndim, depth)
     slices = da.core.slices_from_chunks(chunks)
@@ -284,20 +317,21 @@ files = os.listdir('../data/nuclei_images/')
 
 print('running')
 
-for file in files: 
-    if file not in os.listdir('../output/'): 
-        img = imread('../data/nuclei_images/' + file)
-        print('image loaded')
-        img = np.moveaxis(np.array([img]), 0, 3) # function requires a numpy array, (z, y, x, channel)
-        print(img.shape)
-        masks = segment(
-            img, 
-            channels = [0, 0], model_type = 'nuclei', 
-            diameter = (d/anisotropy, d, d), fast_mode = False, use_anisotropy  = True, anisotropy = anisotropy
-        )
-        # print('saving')
-        # np.save('../output/nuclear_segs/' + file, masks)
-        # dask.array.store(sources = masks, '../output/nuclear_segs/' + file)
-        dask.array.to_npy_stack('../output/nuclear_segs/' + file, masks)
-        # print(masks)
-        print('finished image' + file)
+# for file in files: 
+#     if file not in os.listdir('../output/nuclear_segs/'): 
+#         img = imread('../data/nuclei_images/' + file)
+#         print('image loaded ' + file)
+#         img = np.moveaxis(np.array([img]), 0, 3) # function requires a numpy array, (z, y, x, channel)
+#         print(img.shape)
+#         print(img.dtype)
+#         masks = segment(
+#             img[:, 0:1000, 0:1000], 
+#             channels = [0, 0], model_type = 'nuclei', 
+#             diameter = (d/anisotropy, d, d), fast_mode = False, use_anisotropy  = True, anisotropy = anisotropy
+#         )
+#         # print('saving')
+#         # np.save('../output/nuclear_segs/' + file, masks)
+#         # dask.array.store(sources = masks, '../output/nuclear_segs/' + file)
+#         dask.array.to_npy_stack('../output/nuclear_segs/' + file, masks)
+#         # print(masks)
+#         print('finished image' + file)
